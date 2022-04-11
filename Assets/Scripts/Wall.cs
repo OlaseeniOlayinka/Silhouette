@@ -2,47 +2,167 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using System.Linq;
+using VLB;
 
 public class Wall : MonoBehaviour
 {
-    private GameObject[] boxes;
-    private GameObject[] clones;
-    private const string BOX_TAG = "Box";
+    public static readonly string SHADOW_TAG = "Shadow";
     public Vector3 wallScale;
-    private float OFFSET = 0.001f;
+    public GameObject flashlight;
+    public Material shadowMaterial;
+    public const string redBoxTag = "RedBox";
+    public const string blueBoxTag = "BlueBox";
+
+    private GameObject[] polys;
+    private Dictionary<GameObject, GameObject> cloneMap;
+    private const string UNTAGGED_TAG = "Untagged";
+    private const float OFFSET = 0.01f;
+    public enum WallColor
+    {
+        Red,
+        Blue,
+        Default
+    }
 
     // given a clone and box, modify the clone's transform so that it forms a shadow on this wall
-    private void SetCloneShadowOnWall(GameObject clone, GameObject box)
+    private void SetCloneShadowOnWall(GameObject poly)
     {
-        //Vector3 wallUp = this.transform.up;
+        GameObject clone = cloneMap[poly];
         Vector3 wallPosition = this.transform.position;
+        clone.transform.position = poly.transform.position;
+        clone.transform.rotation = poly.transform.rotation;
 
-        Vector3 boxPosition = box.transform.position;
-        float x = (boxPosition.x * wallScale.x) + wallPosition.x - Mathf.Sign(wallPosition.x) * OFFSET;
-        float z = (boxPosition.z * wallScale.z) + wallPosition.z - Mathf.Sign(wallPosition.z) * OFFSET;
-        clone.transform.position = new Vector3(x, clone.transform.position.y, z);
-        clone.transform.GetChild(0).transform.rotation = box.transform.GetChild(0).transform.rotation;
+        foreach (Transform polyCube in poly.transform)
+        {
+            GameObject cloneCube;
+            if (cloneMap.TryGetValue(polyCube.gameObject, out cloneCube) == false)
+            {
+                continue;
+            }
+
+            float x = (polyCube.position.x * wallScale.x) + wallPosition.x;
+            float z = (polyCube.position.z * wallScale.z) + wallPosition.z;
+            cloneCube.transform.position = new Vector3(x, cloneCube.transform.position.y, z);
+        }
+    }
+
+    private void SetFlashlightColor(WallColor color)
+    {
+        flashlight.SetActive(true);
+
+        var lightBeam = flashlight.transform.Find("Volumetric Light Beam");
+        if (lightBeam == null)
+        {
+            Debug.LogError($"No Volumetric Light Beam found in ${this.name} flashlight");
+            return;
+        }
+
+        VolumetricLightBeam lightBeamScript = lightBeam.GetComponent<VolumetricLightBeam>();
+                
+        switch (color)
+        {
+            case WallColor.Blue:
+            {
+                lightBeamScript.color = new Color(0, 0, 1);
+                break;
+            }
+
+            case WallColor.Red:
+            {
+                lightBeamScript.color = new Color(1, 0, 0);
+                break;
+            }
+
+            default:
+            {
+                lightBeamScript.color = new Color(1, 1, 1);
+                break;
+            }
+        }
     }
 
     // Start is called before the first frame update
     void Start()
     {
+        cloneMap = new Dictionary<GameObject, GameObject>();
+
+        Dictionary<string, WallColor> tagToColor = new Dictionary<string, WallColor>()
+        {
+            [SolutionManager.redWallTag] = WallColor.Red,
+            [SolutionManager.blueWallTag] = WallColor.Blue,
+            [redBoxTag] = WallColor.Red,
+            [blueBoxTag] = WallColor.Blue,
+        };
+
+        var defaultLayer = LayerMask.NameToLayer("Default");
+        var solutionManager = GameObject.Find("SolutionManager").GetComponent<SolutionManager>();
+
+        WallColor wallColor = WallColor.Default;
+        string wallTag = solutionManager.wallSolutions.First(go => go.name.StartsWith(this.name))?.tag ?? "";
+        if (tagToColor.ContainsKey(wallTag))
+        {
+            wallColor = tagToColor[wallTag];
+        }
+
         Vector3 wallPosition = this.transform.position;
-        boxes = GameObject.FindGameObjectsWithTag(BOX_TAG).Select(box => box.transform.parent.gameObject).ToArray();
-        clones = new GameObject[boxes.Length];
-        for (int i = 0; i < boxes.Length; ++i)
+        polys = GameObject.FindGameObjectsWithTag(PlayerMovement.POLY_TAG);
+        for (int i = 0; i < polys.Length; ++i)
         {
             // Make a clone of the box
-            GameObject box = boxes[i];
-            GameObject clone = Instantiate(box);
-            clones[i] = clone;
-            Vector3 scale = box.transform.localScale;
+            GameObject poly = polys[i];
+            GameObject polyClone = Instantiate(poly);
+            GameObject shadow = new GameObject();
 
-            // "flatten" the clone on the wall
-            clone.transform.localScale = new Vector3(scale.x * wallScale.x, scale.y * wallScale.y, scale.z * wallScale.z);
+            cloneMap[poly] = polyClone;
 
+            shadow.name = $"{poly.name} shadow on {this.name}";
+            polyClone.transform.SetParent(shadow.transform);
+
+            // give the shadow some thickness greater than 0 to avoid weird graphics bugs
+            shadow.transform.localScale = new Vector3(Mathf.Max(OFFSET, wallScale.x), Mathf.Max(OFFSET, wallScale.y), Mathf.Max(OFFSET, wallScale.z));
+            shadow.transform.position = new Vector3(wallPosition.x, 0, wallPosition.z);
+            
+            // change tag from "poly" to "untagged"
+            polyClone.tag = UNTAGGED_TAG;
+
+            // change each cube's tag inside the poly to SHADOW_TAG to prevent selection/deselection
+            // also change material to shadow material
+            for (int j = 0; j < polyClone.transform.childCount; ++j) {
+                Transform polyCube = poly.transform.GetChild(j);
+                var cubeClone = polyClone.transform.GetChild(j);
+                var cubeColor = WallColor.Default;
+
+                // Handle colored boxes
+                var childCube = cubeClone.childCount > 0 ? cubeClone.GetChild(0) : null;
+                if (childCube)
+                {
+                    // determine the color of this cube
+                    cubeColor = tagToColor.TryGetValue(childCube.tag, out cubeColor) ? cubeColor : WallColor.Default;
+
+                    if (cubeColor == wallColor)
+                    {
+                        // Don't make a shadow for this cube if it is the same color as the light
+                        Destroy(cubeClone.gameObject);
+                        continue;
+                    }
+                    else
+                    {
+                        // the shadow clone doesn't need the extra nested cube
+                        Destroy(childCube.gameObject);
+                    }
+                }
+
+                cloneMap[polyCube.gameObject] = cubeClone.gameObject;
+
+                cubeClone.tag = SHADOW_TAG;
+                cubeClone.gameObject.layer = defaultLayer;
+                cubeClone.gameObject.GetComponent<MeshRenderer>().material = shadowMaterial;                
+            }
+         
             // Set the transform and box rotation on the wall
-            SetCloneShadowOnWall(clone, box);
+            SetCloneShadowOnWall(poly);
+
+            SetFlashlightColor(wallColor);
         }
     }
 
@@ -50,11 +170,17 @@ public class Wall : MonoBehaviour
     void Update()
     {
         // the shadow clones will follow their original boxes
-        for (int i = 0; i < boxes.Length; ++i)
+        foreach (GameObject poly in polys)
         {
-            GameObject box = boxes[i];
-            GameObject clone = clones[i];
-            SetCloneShadowOnWall(clone, box);
+            try
+            {
+                SetCloneShadowOnWall(poly);
+            } 
+            catch (System.Exception e)
+            {
+                Debug.Log("error" + e.Message);
+            }
+            
         }
     }
 }
